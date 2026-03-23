@@ -1,0 +1,327 @@
+flowchart LR
+classDef oe fill:#1e40af,color:#ffffff,stroke:#1e3a8a,stroke-width:2px
+classDef pe fill:#6d28d9,color:#ffffff,stroke:#5b21b6,stroke-width:2px
+classDef shared fill:#065f46,color:#ffffff,stroke:#064e3b,stroke-width:2px
+classDef handoff fill:#92400e,color:#ffffff,stroke:#78350f,stroke-width:4px
+classDef rollback fill:#991b1b,color:#ffffff,stroke:#7f1d1d,stroke-width:2px
+classDef decision fill:#1f2937,color:#ffffff,stroke:#111827,stroke-width:2px
+classDef backup fill:#0e4f6b,color:#ffffff,stroke:#0284c7,stroke-width:2px,stroke-dasharray:6 3
+classDef terminal fill:#14532d,color:#ffffff,stroke:#166534,stroke-width:3px
+classDef escalate fill:#4a1d96,color:#ffffff,stroke:#3b0764,stroke-width:2px
+classDef ad fill:#0f766e,color:#ffffff,stroke:#0d9488,stroke-width:2px
+
+PRE["PRE-CONDITIONS  ·  SHARED GATE
+────────────────────────────────
+✔ Server provisioned and reachable
+✔ Java runtime installed — version known
+✔ Application deployable in known-good state
+✔ Network path to observability backend confirmed
+✔ Artifact registry reachable from target server
+✔ Teams agreed: service name · env label · endpoint · sampling"]:::shared
+
+PRE --> PRE_OK{"Pre-conditions met?"}:::decision
+PRE_OK -->|NO| PRE_BLOCK["Workflow halted
+Resolve pre-conditions
+before proceeding"]:::escalate
+PRE_OK -->|YES| WS_FORK
+WS_FORK(["Workstreams A and B
+begin in parallel"]):::shared
+
+subgraph OE["⚙  OBSERVABILITY ENGINEERING"]
+    direction TB
+    subgraph WS_A["Workstream A — Collector Installation"]
+        direction TB
+        COL_BAK["BACKUP CHECK
+        ─────────────────────────
+        Detect existing Collector install
+        Archive config → .bak.timestamp
+        Archive service unit → .bak.timestamp
+        Archive binary → .bak.timestamp
+        Surface warning if existing install found
+        Require operator confirmation to overwrite"]:::backup
+        COL_STG["Stage OTel Collector Binary
+        ─────────────────────────
+        Pull from artifact registry
+        Verify checksum against known-good hash
+        Stage to temp working directory"]:::oe
+        COL_INS["Install as System Service
+        ─────────────────────────
+        Copy binary to /usr/local/bin/otelcol
+        Write OE-maintained systemd unit file
+        Do not start service yet"]:::oe
+        COL_CFG["Configure Pipelines
+        ─────────────────────────
+        Write config.yaml from OE template
+        Receivers: OTLP gRPC + HTTP on localhost
+        Processors: batch · memory_limiter · resourcedetection
+        Exporters: OTLP/HTTP to backend
+        Pipelines: traces · metrics · logs"]:::oe
+        COL_SRT["Start and Health Check
+        ─────────────────────────
+        systemctl enable --now otelcol
+        Poll :8888/metrics until healthy
+        Verify OTLP port open and listening
+        Timeout: 60s — fail workstream if exceeded"]:::oe
+    end
+    subgraph WS_B["Workstream B — Agent Preparation"]
+        direction TB
+        AGT_STG["Stage Java Agent JAR
+        ─────────────────────────
+        Pull version-pinned JAR from artifact registry
+        Verify checksum
+        Stage to /opt/otel/opentelemetry-javaagent.jar
+        Set permissions: runtime user read-only"]:::oe
+        AGT_CFG["Build Configuration Payload
+        ─────────────────────────
+        -javaagent:/opt/otel/opentelemetry-javaagent.jar
+        OTEL_SERVICE_NAME = agreed service name
+        OTEL_EXPORTER_OTLP_ENDPOINT = http://localhost:4317
+        OTEL_RESOURCE_ATTRIBUTES = env · host
+        OTEL_TRACES_SAMPLER + sampler arg
+        Additional OTEL_* vars per service spec"]:::oe
+        AGT_PKG["Package Handoff Spec
+        ─────────────────────────
+        Serialize payload → YAML manifest
+        Include: JAR path · JVM args string
+        all OTEL_* key-value pairs
+        Collector endpoint · JAR checksum
+        Store to shared path — both teams readable"]:::oe
+    end
+    SYNC{"SYNC GATE
+    ────────────────
+    Collector healthy?
+    Agent JAR staged?
+    Handoff spec written?
+    ────────────────
+    All must be YES"}:::decision
+end
+
+WS_FORK --> COL_BAK
+COL_BAK --> COL_STG --> COL_INS --> COL_CFG --> COL_SRT --> SYNC
+WS_FORK --> AGT_STG
+AGT_STG --> AGT_CFG --> AGT_PKG --> SYNC
+SYNC -->|"Any workstream failed"| SYNC_FAIL["Halt workflow
+Retry or escalate failed workstream only
+Passing workstream holds"]:::rollback
+SYNC -->|"All conditions met"| HANDOFF
+
+HANDOFF["━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FORMAL HANDOFF BOUNDARY  ·  OE → PE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+OE delivers to PE:
+· Agent JAR path on target server
+· Complete JVM argument string  ready to apply
+· All OTEL_* env vars with values  from manifest
+· Collector endpoint and port
+· Expected post-restart behavior description
+· Rollback procedure document  authored by OE
+· Backup requirements checklist
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PE acknowledges receipt and confirms manifest understood
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"]:::handoff
+
+subgraph PE["🏗  PLATFORM ENGINEERING"]
+    direction TB
+    PE_BAK["BACKUP — Runtime Config
+    ─────────────────────────
+    Copy startup script → .bak.timestamp
+    Copy JVM options file → .bak.timestamp
+    Export current env var state to snapshot file
+    Record backup path in change ticket
+    CONFIRM backup is non-zero before proceeding"]:::backup
+    PE_JVM["Apply JVM Argument
+    ─────────────────────────
+    Add -javaagent arg to runtime startup config
+    Apply to canonical JVM args location
+    PE determines exact mechanism
+    Full arg string applied verbatim from manifest"]:::pe
+    PE_ENV["Set Environment Variables
+    ─────────────────────────
+    Apply all OTEL_* vars from OE manifest
+    Check for conflicts with existing OTEL_* vars
+    Surface conflicts to OE before overwriting
+    Do not silently overwrite conflicting values"]:::pe
+    PE_RST{"Restart Runtime
+    ─────────────────────────
+    Controlled shutdown — not kill
+    Monitor startup logs for agent load banner
+    Runtime start succeeded?"}:::decision
+end
+
+HANDOFF --> PE_BAK --> PE_JVM --> PE_ENV --> PE_RST
+PE_RST -->|"Runtime fails to start"| RB_T1_TRIGGER["Initiate Tier 1 Rollback immediately
+Do not retry with agent flags present"]:::rollback
+
+subgraph VAL["✅  VALIDATION  ·  THREE-TEAM RESPONSIBILITY"]
+    direction TB
+
+    VAL_FORK(["All three teams validate in parallel"]):::shared
+
+    subgraph VAL_OE["Observability Engineering Track"]
+        direction TB
+        VO_AGT["Agent Load Confirmation
+        ─────────────────────────
+        OTel Java Agent banner in JVM startup logs
+        -javaagent present in process cmdline"]:::oe
+        VO_COL["Telemetry Reaching Collector
+        ─────────────────────────
+        Inspect OTLP receiver logs for incoming data
+        Check otelcol_receiver_accepted_spans > 0
+        Window: 2–3 min post-startup"]:::oe
+        VO_EXP["Collector Exporting to Backend
+        ─────────────────────────
+        Exporter logs show successful export
+        Data visible in observability backend UI"]:::oe
+    end
+
+    subgraph VAL_PE["Platform Engineering Track"]
+        direction TB
+        VP_AVL["Runtime Availability
+        ─────────────────────────
+        Runtime process running and responsive
+        Health endpoint returning healthy"]:::pe
+        VP_LOG["Application Log Review
+        ─────────────────────────
+        No unexpected errors or exceptions
+        No classloading or JVM startup failures"]:::pe
+        VP_PERF["Performance Baseline Check
+        ─────────────────────────
+        Response times within acceptable range
+        No resource exhaustion observed"]:::pe
+    end
+
+    subgraph VAL_AD["Application Development Track"]
+        direction TB
+        VA_SMK["Smoke Test Execution
+        ─────────────────────────
+        Critical path requests complete successfully
+        No functional regressions in happy path"]:::ad
+        VA_REG["Regression Verification
+        ─────────────────────────
+        Automated regression suite executed
+        No new test failures introduced"]:::ad
+        VA_BIZ["Business Functionality Sign-off
+        ─────────────────────────
+        Key business workflows confirmed operational
+        Application team accepts instrumented state"]:::ad
+    end
+
+    VAL_DEC{"All three tracks
+    passed?"}:::decision
+end
+
+PE_RST -->|"Runtime started successfully"| VAL_FORK
+VAL_FORK --> VO_AGT
+VAL_FORK --> VP_AVL
+VAL_FORK --> VA_SMK
+VO_AGT --> VO_COL --> VO_EXP --> VAL_DEC
+VP_AVL --> VP_LOG --> VP_PERF --> VAL_DEC
+VA_SMK --> VA_REG --> VA_BIZ --> VAL_DEC
+VAL_DEC -->|"YES"| SUCCESS["INSTRUMENTATION COMPLETE
+─────────────────────────────────────
+Runtime fully instrumented · Telemetry flowing end-to-end
+Document: agent ver · collector ver · config hashes
+Close change record"]:::terminal
+VAL_DEC -->|"NO"| RB_TRIAGE
+
+subgraph ROLLBACK["🔴  ROLLBACK  ·  DATA COLLECTION  ·  RECOVERY"]
+    direction TB
+
+    RB_TRIAGE{"ROLLBACK TRIAGE
+    ─────────────────────
+    What failed?
+    Determines rollback tier
+    AND data collection scope"}:::decision
+
+    RCA_START(["Root Cause Analysis
+    ─────────────────────────────────────────
+    Begins immediately in parallel with rollback
+    Always required — not conditional"]):::shared
+
+    subgraph RB_T1["TIER 1 — Agent / Runtime  ·  PE Executes  ·  Immediate"]
+        direction TB
+        T1_A["Stop Java runtime — controlled shutdown"]:::rollback
+        T1_B["Remove -javaagent arg from startup config"]:::rollback
+        T1_C["Unset all OTEL_* environment variables"]:::rollback
+        T1_D["Restore startup script from timestamped backup"]:::rollback
+        T1_E["Restart runtime — confirm clean start
+        Confirm no agent log line present
+        Confirm application functional"]:::rollback
+        T1_DC["DATA COLLECTION — Tier 1
+        ─────────────────────────
+        JVM startup logs · agent banner output
+        OTEL_* environment variable snapshot
+        -javaagent argument state pre/post
+        Application error logs from failure window"]:::backup
+    end
+
+    subgraph RB_T2["TIER 2 — Collector  ·  OE Executes  ·  Immediate"]
+        direction TB
+        T2_A["systemctl stop otelcol"]:::rollback
+        T2_B["Config issue? Restore config.yaml from backup
+        Install issue? Remove service unit + binary"]:::rollback
+        T2_C["Verify no orphaned otelcol processes
+        Confirm OTLP port no longer in use"]:::rollback
+        T2_DC["DATA COLLECTION — Tier 2
+        ─────────────────────────
+        Collector service logs · config file state
+        Internal metrics endpoint output
+        Exporter error logs · receiver drop counts"]:::backup
+    end
+
+    RB_FULL["TIER 3 — Full Rollback  ·  Both Teams  ·  Immediate  ·  PE First
+    ─────────────────────────────────────────────────────────────────
+    STEP 1: Tier 1 — PE rolls back runtime · wait for stable
+    STEP 2: Tier 2 — OE removes Collector
+    DATA COLLECTION: all Tier 1 + Tier 2 artifacts
+    plus: full environment state · network path confirmation
+    AD test output · request traces from failure window"]:::rollback
+
+    RB_POST["POST-ROLLBACK VERIFICATION  ·  Shared
+    ─────────────────────────────────────────────────
+    Runtime running and application healthy
+    No orphaned otelcol processes
+    No OTEL_* vars in runtime environment
+    No -javaagent in running process cmdline
+    All diagnostic data preserved and accessible"]:::shared
+
+    TIMEBOX{"Still within
+    change window?"}:::decision
+
+    CLOSE["CLOSE CHANGE — UNSUCCESSFUL
+    ─────────────────────────────────────────────────
+    Change record closed — no incident required
+    Rollback completed within change window
+    Outcome documented in change record"]:::escalate
+
+    INCIDENT["FILE INCIDENT
+    ─────────────────────────────────────────────────
+    Impact extended beyond change window
+    Incident opened and assigned
+    Change record linked to incident"]:::escalate
+
+    RCA_COMPLETE["RCA REQUIRED BEFORE ANY RETRY
+    ─────────────────────────────────────────────────
+    RCA findings formally documented and accepted
+    Root cause confirmed — not assumed
+    Automation scripts or process corrected and peer-reviewed
+    New change request raised, approved, and scheduled
+    Previous change artifacts preserved for reference"]:::shared
+end
+
+RB_TRIAGE -->|"Agent or runtime only"| T1_A
+RB_TRIAGE -->|"Collector only"| T2_A
+RB_TRIAGE -->|"Both or scope unclear"| RB_FULL
+RB_TRIAGE --> RCA_START
+RB_T1_TRIGGER --> RB_TRIAGE
+T1_A --> T1_B --> T1_C --> T1_D --> T1_E --> RB_POST
+T1_DC --> RB_POST
+T2_A --> T2_B --> T2_C --> RB_POST
+T2_DC --> RB_POST
+RB_FULL --> RB_POST
+RCA_START --> RB_POST
+RB_POST --> TIMEBOX
+TIMEBOX -->|"YES — rollback complete in window"| CLOSE
+TIMEBOX -->|"NO — window exceeded"| INCIDENT
+CLOSE --> RCA_COMPLETE
+INCIDENT --> RCA_COMPLETE
