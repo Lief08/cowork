@@ -1,0 +1,115 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# AzDO CI Pipeline — Java (Spring Boot) Data Masking PoC App
+#
+# Builds the JAR with Maven, then builds and pushes the Docker image to ACR.
+# Triggered on changes to the java-app source or this pipeline file.
+#
+# Required pipeline variables (set in pipeline settings or a variable group):
+#   CONTAINER_REGISTRY   — ACR login server, e.g. myacr.azurecr.io
+#   SERVICE_CONNECTION   — AzDO service connection name for ACR
+#
+# Optional override variables:
+#   IMAGE_REPOSITORY     — default: java-datamask-app
+# ─────────────────────────────────────────────────────────────────────────────
+
+trigger:
+  branches:
+    include:
+      - main
+      - otel-col-datamask
+  paths:
+    include:
+      - "apps/java-app/**"
+      - "pipelines/azure-pipelines-java.yml"
+
+pr:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - "apps/java-app/**"
+
+pool:
+  vmImage: "ubuntu-latest"
+
+variables:
+  # ── Required: set these in pipeline settings or a linked variable group ──
+  # CONTAINER_REGISTRY: "myacr.azurecr.io"
+  # SERVICE_CONNECTION: "myacr-service-connection"
+
+  # ── Optional overrides ────────────────────────────────────────────────────
+  IMAGE_REPOSITORY: "java-datamask-app"
+  IMAGE_TAG: "$(Build.BuildId)"
+  DOCKERFILE_PATH: "apps/java-app/Dockerfile"
+  BUILD_CONTEXT: "apps/java-app"
+
+stages:
+  - stage: Build
+    displayName: "Build & Push Java App to ACR"
+    jobs:
+      - job: BuildAndPush
+        displayName: "Maven package → Docker build & push"
+        steps:
+          # ── Step 1: Maven build ──────────────────────────────────────────
+          - task: Maven@4
+            displayName: "Maven: clean package (skip tests)"
+            inputs:
+              mavenPomFile: "apps/java-app/pom.xml"
+              goals: "clean package"
+              options: "-DskipTests"
+              javaHomeOption: "JDKVersion"
+              jdkVersionOption: "1.17"
+              publishJUnitResults: false
+
+          # ── Step 2: Docker build & push ──────────────────────────────────
+          # Produces two tags: $(Build.BuildId) (immutable) and "latest" (rolling).
+          # Use the BuildId tag in Helm --set image.tag for reproducible deploys.
+          - task: Docker@2
+            displayName: "Docker: build & push to ACR"
+            inputs:
+              command: buildAndPush
+              repository: "$(IMAGE_REPOSITORY)"
+              dockerfile: "$(DOCKERFILE_PATH)"
+              buildContext: "$(BUILD_CONTEXT)"
+              containerRegistry: "$(SERVICE_CONNECTION)"
+              tags: |
+                $(IMAGE_TAG)
+                latest
+
+          # ── Step 3: Export image tag for downstream stages ───────────────
+          - bash: |
+              echo "##vso[task.setvariable variable=IMAGE_TAG;isOutput=true]$(IMAGE_TAG)"
+              echo "Built and pushed: $(CONTAINER_REGISTRY)/$(IMAGE_REPOSITORY):$(IMAGE_TAG)"
+            displayName: "Output: published image tag"
+            name: imageOutput
+
+  # ── CD skeleton (commented out — wire up when ready) ─────────────────────
+  # - stage: Deploy
+  #   displayName: "Deploy to AKS (PoC namespace)"
+  #   dependsOn: Build
+  #   condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  #   jobs:
+  #     - deployment: DeployHelm
+  #       displayName: "Helm upgrade --install java-datamask-app"
+  #       environment: "aks-poc"
+  #       strategy:
+  #         runOnce:
+  #           deploy:
+  #             steps:
+  #               - checkout: self
+  #               - task: HelmDeploy@0
+  #                 displayName: "Helm: upgrade java-datamask-app"
+  #                 inputs:
+  #                   connectionType: "Kubernetes Service Connection"
+  #                   kubernetesServiceConnection: "$(K8S_SERVICE_CONNECTION)"
+  #                   namespace: "poc"
+  #                   command: "upgrade"
+  #                   chartType: "FilePath"
+  #                   chartPath: "apps/java-app/helm/java-datamask-app"
+  #                   releaseName: "java-datamask-app"
+  #                   overrideValues: >
+  #                     image.repository=$(CONTAINER_REGISTRY)/$(IMAGE_REPOSITORY),
+  #                     image.tag=$(IMAGE_TAG)
+  #                   install: true
+  #                   waitForExecution: true

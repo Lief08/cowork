@@ -1,0 +1,256 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# EDOT Collector — Helm Values
+#
+# Helm chart:  open-telemetry/opentelemetry-collector
+# Chart repo:  https://open-telemetry.github.io/opentelemetry-helm-charts
+#
+# Install command (run once per cluster):
+#   helm repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts
+#   helm repo update
+#   kubectl create namespace observability
+#
+# Deploy / upgrade:
+#   helm upgrade --install edot-collector open-telemetry/opentelemetry-collector \
+#     --namespace observability \
+#     --create-namespace \
+#     -f collector/helm/values.yaml \
+#     --set extraEnvs[0].value="https://<your-apm-endpoint>:443" \
+#     --set-string config.exporters."otlp/downstream".headers.Authorization="ApiKey <key>"
+#
+# To use the downstream OTLP exporter with a Kubernetes Secret instead of
+# --set flags, see the extraEnvs block and the Secret example in docs/COLLECTOR.md.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Run as a Deployment (single instance is sufficient for PoC).
+# For production, consider "daemonset" so each node ships its own telemetry.
+mode: "deployment"
+
+replicaCount: 1
+
+# ─── Image ────────────────────────────────────────────────────────────────────
+# Default: upstream collector-contrib — contains ALL required processors
+# (transform, redact, batch, memory_limiter) and is guaranteed to be
+# compatible with the OTTL statements below.
+#
+# To use the EDOT (Elastic) image instead, override these values:
+#   image:
+#     repository: "docker.elastic.co/elastic-agent/elastic-agent"
+#     tag: "9.0.0"   # pin to a specific release
+#
+# The EDOT image is built on top of collector-contrib, so the processor
+# configuration below is identical for both images.
+image:
+  repository: "otel/opentelemetry-collector-contrib"
+  tag: "0.102.0"
+  pullPolicy: IfNotPresent
+
+# ─── Environment variables ────────────────────────────────────────────────────
+# Downstream OTLP endpoint and auth are injected as env vars so they can be
+# supplied at deploy time without committing secrets to git.
+#
+# Override at helm upgrade time:
+#   --set 'extraEnvs[0].value=https://my-apm.example.com:443'
+# Or reference a pre-existing Kubernetes Secret (recommended for production):
+#   extraEnvs:
+#     - name: OTEL_DOWNSTREAM_ENDPOINT
+#       valueFrom:
+#         secretKeyRef:
+#           name: edot-collector-downstream
+#           key: endpoint
+#     - name: OTEL_DOWNSTREAM_AUTH_HEADER
+#       valueFrom:
+#         secretKeyRef:
+#           name: edot-collector-downstream
+#           key: auth-header
+extraEnvs:
+  - name: OTEL_DOWNSTREAM_ENDPOINT
+    value: "https://REPLACE_ME:443"          # e.g. your Elastic APM server or any OTLP endpoint
+  - name: OTEL_DOWNSTREAM_AUTH_HEADER
+    value: "ApiKey REPLACE_ME"               # e.g. "ApiKey <base64>" or "Bearer <token>"
+
+# ─── Collector configuration ──────────────────────────────────────────────────
+config:
+
+  # ── Receivers ──────────────────────────────────────────────────────────────
+  receivers:
+    otlp:
+      protocols:
+        grpc:
+          endpoint: "0.0.0.0:4317"
+        http:
+          endpoint: "0.0.0.0:4318"
+
+  # ── Processors ─────────────────────────────────────────────────────────────
+  processors:
+
+    # Prevents OOM kills; always keep first in every pipeline
+    memory_limiter:
+      check_interval: 1s
+      limit_mib: 400
+      spike_limit_mib: 100
+
+    batch:
+      send_batch_size: 1000
+      send_batch_max_size: 2000
+      timeout: 10s
+
+    # ── Pipeline A: Static Redaction ─────────────────────────────────────────
+    # Replaces PII patterns in log record bodies with static placeholders.
+    # The original value is gone — it never reaches the downstream exporter.
+    #
+    # This is the PRIMARY pipeline for initial PoC validation.
+    # Activate by including "transform/redact" in the logs/redact pipeline below.
+    # ─────────────────────────────────────────────────────────────────────────
+    transform/redact:
+      error_mode: ignore      # continue processing other records if one statement fails
+      log_statements:
+        - context: log
+          statements:
+            # Social Security Numbers: 123-45-6789  →  [REDACTED-SSN]
+            - replace_pattern(body, "[0-9]{3}-[0-9]{2}-[0-9]{4}", "[REDACTED-SSN]")
+
+            # Unformatted 9-digit SSNs (no dashes): 123456789  →  [REDACTED-SSN-NODASH]
+            # Negative lookahead/lookbehind ensures we don't match substrings of longer numbers.
+            - replace_pattern(body, "(?:^|(?<=[^0-9]))[0-9]{9}(?=$|[^0-9])", "[REDACTED-SSN-NODASH]")
+
+            # Email addresses
+            - replace_pattern(body, "[a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}", "[REDACTED-EMAIL]")
+
+            # US phone numbers: (123) 456-7890 | 123-456-7890 | +1-123-456-7890 | 123.456.7890
+            - replace_pattern(body, "(\\+1[.\\-\\s]?)?\\(?[0-9]{3}\\)?[.\\-\\s][0-9]{3}[.\\-\\s][0-9]{4}", "[REDACTED-PHONE]")
+
+            # 16-digit credit card numbers (with optional spaces or dashes between groups)
+            - replace_pattern(body, "[0-9]{4}[\\-\\s]?[0-9]{4}[\\-\\s]?[0-9]{4}[\\-\\s]?[0-9]{4}", "[REDACTED-CC]")
+
+    # ── Pipeline B: Hash + Redact ─────────────────────────────────────────────
+    # Replaces SSN patterns in log bodies with [REDACTED-SSN] AND stores a
+    # SHA256 hash of the original value as a log attribute for downstream
+    # correlation without retaining the plaintext SSN.
+    #
+    # Requirements:
+    #   - collector-contrib >= v0.98.0 for SHA256() and ExtractPatterns() OTTL functions
+    #   - Verify your EDOT image version before enabling this pipeline.
+    #     If SHA256 is unavailable, see docs/COLLECTOR.md for the MD5() fallback.
+    #
+    # Activate by swapping "transform/redact" for "transform/hash" in the
+    # service.pipelines.logs section below (comment/uncomment as needed).
+    # ─────────────────────────────────────────────────────────────────────────
+    transform/hash:
+      error_mode: ignore
+      log_statements:
+        - context: log
+          statements:
+            # Step 1 — Extract the SSN from the log body into a temporary attribute.
+            #           ExtractPatterns() returns a map of named capture groups.
+            - set(attributes["_tmp_ssn"], ExtractPatterns(body, "(?P<ssn>[0-9]{3}-[0-9]{2}-[0-9]{4})")["ssn"]) where IsMatch(body, "[0-9]{3}-[0-9]{2}-[0-9]{4}")
+
+            # Step 2 — Hash the extracted value and store for downstream correlation.
+            #           SHA256() returns a lowercase hex-encoded digest.
+            - set(attributes["pii.ssn.hashed"], SHA256(attributes["_tmp_ssn"])) where attributes["_tmp_ssn"] != ""
+
+            # Step 3 — Remove the temporary extraction attribute (never ship raw PII).
+            - delete_key(attributes, "_tmp_ssn")
+
+            # Step 4 — Flag the record so downstream systems can audit/alert on PII presence.
+            - set(attributes["pii.detected"], true) where IsMatch(body, "[0-9]{3}-[0-9]{2}-[0-9]{4}")
+
+            # Step 5 — Redact the SSN from the log body (same as Pipeline A).
+            - replace_pattern(body, "[0-9]{3}-[0-9]{2}-[0-9]{4}", "[REDACTED-SSN]")
+
+            # Step 6 — Redact other PII patterns.
+            - replace_pattern(body, "[a-zA-Z0-9._%+\\-]+@[a-zA-Z0-9.\\-]+\\.[a-zA-Z]{2,}", "[REDACTED-EMAIL]")
+            - replace_pattern(body, "(\\+1[.\\-\\s]?)?\\(?[0-9]{3}\\)?[.\\-\\s][0-9]{3}[.\\-\\s][0-9]{4}", "[REDACTED-PHONE]")
+            - replace_pattern(body, "[0-9]{4}[\\-\\s]?[0-9]{4}[\\-\\s]?[0-9]{4}[\\-\\s]?[0-9]{4}", "[REDACTED-CC]")
+
+  # ── Exporters ──────────────────────────────────────────────────────────────
+  exporters:
+
+    # Debug exporter: writes full telemetry to collector pod stdout.
+    # Primary verification mechanism during PoC:
+    #   kubectl logs -l app.kubernetes.io/name=opentelemetry-collector \
+    #     -n observability -f | grep -i "SSN\|REDACTED\|pii"
+    debug:
+      verbosity: detailed
+      # sampling_initial and sampling_thereafter limit log volume at steady state.
+      # Remove or increase for full visibility during active testing.
+      sampling_initial: 5
+      sampling_thereafter: 200
+
+    # Downstream OTLP exporter — ships processed (masked) telemetry onward.
+    # Endpoint and auth come from the extraEnvs block above.
+    # Comment this exporter out (and remove from pipeline exporters list) if you
+    # want to validate locally with the debug exporter only before wiring up a
+    # real downstream system.
+    otlp/downstream:
+      endpoint: ${env:OTEL_DOWNSTREAM_ENDPOINT}
+      headers:
+        Authorization: ${env:OTEL_DOWNSTREAM_AUTH_HEADER}
+      tls:
+        insecure: false
+      retry_on_failure:
+        enabled: true
+        initial_interval: 5s
+        max_interval: 30s
+        max_elapsed_time: 300s
+      sending_queue:
+        enabled: true
+        num_consumers: 10
+        queue_size: 1000
+
+  # ── Service / Pipelines ────────────────────────────────────────────────────
+  service:
+    pipelines:
+      # ── LOGS: choose ONE masking strategy ──────────────────────────────────
+      #
+      # Pipeline A — Static redaction (default for initial PoC)
+      # Uncomment logs/hash and comment out logs/redact to switch strategies.
+      # Only one logs pipeline should be active at a time during testing.
+      # ───────────────────────────────────────────────────────────────────────
+
+      logs/redact:
+        receivers:   [otlp]
+        processors:  [memory_limiter, transform/redact, batch]
+        exporters:   [debug, otlp/downstream]
+
+      # Pipeline B — Hash + redact (comment out logs/redact, uncomment this)
+      # logs/hash:
+      #   receivers:  [otlp]
+      #   processors: [memory_limiter, transform/hash, batch]
+      #   exporters:  [debug, otlp/downstream]
+
+      # Traces and metrics are forwarded as-is (no PII masking applied here)
+      traces:
+        receivers:  [otlp]
+        processors: [memory_limiter, batch]
+        exporters:  [debug, otlp/downstream]
+
+      metrics:
+        receivers:  [otlp]
+        processors: [memory_limiter, batch]
+        exporters:  [debug, otlp/downstream]
+
+# ─── Service ports ────────────────────────────────────────────────────────────
+service:
+  type: ClusterIP
+
+ports:
+  otlp:
+    enabled: true
+    containerPort: 4317
+    servicePort: 4317
+    protocol: TCP
+    appProtocol: grpc
+  otlp-http:
+    enabled: true
+    containerPort: 4318
+    servicePort: 4318
+    protocol: TCP
+
+# ─── Resources ────────────────────────────────────────────────────────────────
+resources:
+  requests:
+    cpu: "100m"
+    memory: "256Mi"
+  limits:
+    cpu: "500m"
+    memory: "512Mi"

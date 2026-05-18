@@ -1,0 +1,6 @@
+apiVersion: v2
+name: java-datamask-app
+description: Spring Boot data masking PoC — emits log records containing synthetic PII for OTel Collector redaction testing
+type: application
+version: 1.0.0
+appVersion: "1.0.0"

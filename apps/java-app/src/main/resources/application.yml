@@ -1,0 +1,28 @@
+server:
+  port: 8080
+
+spring:
+  application:
+    # Falls back to the literal string if OTEL_SERVICE_NAME is not set
+    name: ${OTEL_SERVICE_NAME:java-datamask-app}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info
+  endpoint:
+    health:
+      # Enable Kubernetes liveness/readiness probe sub-paths:
+      #   /actuator/health/liveness
+      #   /actuator/health/readiness
+      probes:
+        enabled: true
+      show-details: always
+
+logging:
+  level:
+    com.example.datamask: DEBUG
+    root: INFO
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss.SSS} [%thread] %-5level %logger{36} - %msg%n"

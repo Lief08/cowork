@@ -1,0 +1,52 @@
+replicaCount: 1
+
+image:
+  # Set this to your ACR login server path, e.g.: myacr.azurecr.io/java-datamask-app
+  # The AzDO pipeline will override this via --set image.repository and --set image.tag
+  repository: ""
+  tag: "latest"
+  pullPolicy: IfNotPresent
+
+nameOverride: ""
+fullnameOverride: ""
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 8080
+
+resources:
+  requests:
+    cpu: "100m"
+    memory: "256Mi"
+  limits:
+    cpu: "500m"
+    memory: "512Mi"
+
+# ─── OpenTelemetry Configuration ───────────────────────────────────────────────
+# NOTE: If the cluster uses the OTel Operator with an Instrumentation CRD for
+# EDOT auto-injection, these env vars may already be injected by the operator.
+# In that case either:
+#   a) Set otel.enabled=false to suppress this block (operator values win), or
+#   b) Leave enabled=true to explicitly override the endpoint (these values win
+#      for env vars the operator does not set).
+otel:
+  enabled: true
+  # Service name as it will appear in the APM/observability backend
+  serviceName: "java-datamask-app"
+  # Deployment environment tag (appears as deployment.environment resource attribute)
+  environment: "poc"
+  # OTLP endpoint — should point at the EDOT Collector ClusterIP service.
+  # Default assumes collector is installed in the same namespace as the app.
+  # Cross-namespace: http://edot-collector-opentelemetry-collector.observability.svc.cluster.local:4318
+  endpoint: "http://edot-collector-opentelemetry-collector:4318"
+  protocol: "http/protobuf"
+  logsExporter: "otlp"
+  tracesExporter: "otlp"
+  metricsExporter: "otlp"
+
+podAnnotations: {}
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

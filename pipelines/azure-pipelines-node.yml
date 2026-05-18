@@ -1,0 +1,119 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# AzDO CI Pipeline — Node.js (Express) Data Masking PoC App
+#
+# Installs npm dependencies, then builds and pushes the Docker image to ACR.
+# Triggered on changes to the node-app source or this pipeline file.
+#
+# Required pipeline variables (set in pipeline settings or a variable group):
+#   CONTAINER_REGISTRY   — ACR login server, e.g. myacr.azurecr.io
+#   SERVICE_CONNECTION   — AzDO service connection name for ACR
+#
+# Optional override variables:
+#   IMAGE_REPOSITORY     — default: node-datamask-app
+# ─────────────────────────────────────────────────────────────────────────────
+
+trigger:
+  branches:
+    include:
+      - main
+      - otel-col-datamask
+  paths:
+    include:
+      - "apps/node-app/**"
+      - "pipelines/azure-pipelines-node.yml"
+
+pr:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - "apps/node-app/**"
+
+pool:
+  vmImage: "ubuntu-latest"
+
+variables:
+  # ── Required: set these in pipeline settings or a linked variable group ──
+  # CONTAINER_REGISTRY: "myacr.azurecr.io"
+  # SERVICE_CONNECTION: "myacr-service-connection"
+
+  # ── Optional overrides ────────────────────────────────────────────────────
+  IMAGE_REPOSITORY: "node-datamask-app"
+  IMAGE_TAG: "$(Build.BuildId)"
+  DOCKERFILE_PATH: "apps/node-app/Dockerfile"
+  BUILD_CONTEXT: "apps/node-app"
+
+stages:
+  - stage: Build
+    displayName: "Build & Push Node.js App to ACR"
+    jobs:
+      - job: BuildAndPush
+        displayName: "npm ci → Docker build & push"
+        steps:
+          # ── Step 1: Node.js setup ────────────────────────────────────────
+          - task: NodeTool@0
+            displayName: "Use Node.js 20.x"
+            inputs:
+              versionSpec: "20.x"
+
+          # ── Step 2: Install & validate dependencies ──────────────────────
+          # npm ci is used (not npm install) to ensure reproducibility from
+          # package-lock.json.  This also validates the lock file is up to date.
+          - bash: |
+              cd apps/node-app
+              npm ci
+            displayName: "npm ci (validate dependencies)"
+
+          # ── Step 3: Docker build & push ──────────────────────────────────
+          # Produces two tags: $(Build.BuildId) (immutable) and "latest" (rolling).
+          # The Dockerfile runs its own npm ci --omit=dev, so the pipeline
+          # npm ci above is only for validation / audit purposes.
+          - task: Docker@2
+            displayName: "Docker: build & push to ACR"
+            inputs:
+              command: buildAndPush
+              repository: "$(IMAGE_REPOSITORY)"
+              dockerfile: "$(DOCKERFILE_PATH)"
+              buildContext: "$(BUILD_CONTEXT)"
+              containerRegistry: "$(SERVICE_CONNECTION)"
+              tags: |
+                $(IMAGE_TAG)
+                latest
+
+          # ── Step 4: Export image tag for downstream stages ───────────────
+          - bash: |
+              echo "##vso[task.setvariable variable=IMAGE_TAG;isOutput=true]$(IMAGE_TAG)"
+              echo "Built and pushed: $(CONTAINER_REGISTRY)/$(IMAGE_REPOSITORY):$(IMAGE_TAG)"
+            displayName: "Output: published image tag"
+            name: imageOutput
+
+  # ── CD skeleton (commented out — wire up when ready) ─────────────────────
+  # - stage: Deploy
+  #   displayName: "Deploy to AKS (PoC namespace)"
+  #   dependsOn: Build
+  #   condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  #   jobs:
+  #     - deployment: DeployHelm
+  #       displayName: "Helm upgrade --install node-datamask-app"
+  #       environment: "aks-poc"
+  #       strategy:
+  #         runOnce:
+  #           deploy:
+  #             steps:
+  #               - checkout: self
+  #               - task: HelmDeploy@0
+  #                 displayName: "Helm: upgrade node-datamask-app"
+  #                 inputs:
+  #                   connectionType: "Kubernetes Service Connection"
+  #                   kubernetesServiceConnection: "$(K8S_SERVICE_CONNECTION)"
+  #                   namespace: "poc"
+  #                   command: "upgrade"
+  #                   chartType: "FilePath"
+  #                   chartPath: "apps/node-app/helm/node-datamask-app"
+  #                   releaseName: "node-datamask-app"
+  #                   overrideValues: >
+  #                     image.repository=$(CONTAINER_REGISTRY)/$(IMAGE_REPOSITORY),
+  #                     image.tag=$(IMAGE_TAG)
+  #                   install: true
+  #                   waitForExecution: true
