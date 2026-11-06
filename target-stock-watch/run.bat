@@ -25,6 +25,7 @@ if not exist .venv (
   python -m playwright install chromium || goto :fail
 ) else (
   call .venv\Scripts\activate.bat
+  pip install -q -r requirements.txt
 )
 
 python target_stock_watch.py %*

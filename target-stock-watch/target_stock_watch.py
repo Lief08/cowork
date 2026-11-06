@@ -26,6 +26,7 @@ Tips:
 import os
 import random
 import secrets
+import ssl
 import sys
 import urllib.request
 import time
@@ -58,7 +59,8 @@ BUY_SELECTORS = [
     'button[data-test="scheduledDeliveryButton"]',
 ]
 BUY_TEXT = ["add to cart", "ship it", "pick it up", "deliver it"]
-OOS_TEXT = ["out of stock", "sold out", "not available", "temporarily out"]
+OOS_TEXT = ["out of stock", "sold out", "not available", "temporarily out",
+            "isn't available", "unavailable", "coming soon"]
 
 
 def get_ntfy_topic():
@@ -94,7 +96,7 @@ def push(topic, title: str, message: str, url: str = "", priority: str = "defaul
         f"{NTFY_SERVER}/{topic}", data=message.encode("utf-8"), headers=headers, method="POST"
     )
     try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=10, context=_ssl_context()) as resp:
             return 200 <= resp.status < 300
     except Exception as e:
         print(f"(phone push failed: {e})")
@@ -102,6 +104,16 @@ def push(topic, title: str, message: str, url: str = "", priority: str = "defaul
 
 
 NTFY_TOPIC = None
+
+
+def _ssl_context():
+    # Use certifi's up-to-date CA bundle; older Python installs on Windows can
+    # fail with "certificate has expired" using the system store.
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
 
 
 def alert(url: str) -> None:
