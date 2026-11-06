@@ -24,6 +24,14 @@ To watch a different item, pass its URL:
 ./run.sh "https://www.target.com/p/..."
 ```
 
+## Phone alerts
+
+1. Install the free **ntfy** app (iOS or Android).
+2. Start the watcher. It prints a topic name like `target-watch-1a2b3c4d5e6f` (saved in `.ntfy_topic`, reused on later runs).
+3. In the app, tap **+** and subscribe to that topic. You'll get a test push right away.
+
+When stock shows up you get an urgent push that opens the Target page when tapped. Set `NTFY_TOPIC=off` to disable, or `NTFY_TOPIC=your-topic` to pick your own name. Anyone who knows the topic name can see its messages, so keep it random.
+
 ## Notes
 
 - Checks every 45–90 seconds. Don't shorten this much; Target will rate-limit you.

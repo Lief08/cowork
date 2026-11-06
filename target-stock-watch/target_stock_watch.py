@@ -10,6 +10,12 @@ Run:
     python target_stock_watch.py            # watches the Zelda Switch 2 console by default
     python target_stock_watch.py "<any other Target product URL>"
 
+Phone alerts (ntfy):
+    On first run the script creates a private topic name, saves it to
+    .ntfy_topic, and prints it. Install the free ntfy app (iOS/Android),
+    tap +, and subscribe to that topic. A test push is sent at startup.
+    Set NTFY_TOPIC to use your own topic, or NTFY_TOPIC=off to disable.
+
 Tips:
   - Keep the interval reasonable (default ~60s with jitter). Hammering the site
     gets you rate-limited and isn't nice.
@@ -17,8 +23,11 @@ Tips:
   - Sign in to Target in your normal browser with payment saved so checkout is fast.
 """
 
+import os
 import random
+import secrets
 import sys
+import urllib.request
 import time
 import webbrowser
 from datetime import datetime
@@ -35,6 +44,9 @@ DEFAULT_URL = (
     "40th-anniversary-edition-console-system/-/A-1013322047"
 )
 
+TOPIC_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".ntfy_topic")
+NTFY_SERVER = "https://ntfy.sh"
+
 MIN_WAIT = 45   # seconds
 MAX_WAIT = 90   # seconds
 
@@ -49,6 +61,49 @@ BUY_TEXT = ["add to cart", "ship it", "pick it up", "deliver it"]
 OOS_TEXT = ["out of stock", "sold out", "not available", "temporarily out"]
 
 
+def get_ntfy_topic():
+    env = os.environ.get("NTFY_TOPIC", "").strip()
+    if env.lower() == "off":
+        return None
+    if env:
+        return env
+    try:
+        with open(TOPIC_FILE) as f:
+            topic = f.read().strip()
+            if topic:
+                return topic
+    except FileNotFoundError:
+        pass
+    topic = "target-watch-" + secrets.token_hex(6)
+    try:
+        with open(TOPIC_FILE, "w") as f:
+            f.write(topic)
+    except OSError:
+        pass
+    return topic
+
+
+def push(topic, title: str, message: str, url: str = "", priority: str = "default") -> bool:
+    if not topic:
+        return False
+    headers = {"Title": title, "Priority": priority, "Tags": "video_game"}
+    if url:
+        headers["Click"] = url
+        headers["Actions"] = f"view, Open Target, {url}"
+    req = urllib.request.Request(
+        f"{NTFY_SERVER}/{topic}", data=message.encode("utf-8"), headers=headers, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return 200 <= resp.status < 300
+    except Exception as e:
+        print(f"(phone push failed: {e})")
+        return False
+
+
+NTFY_TOPIC = None
+
+
 def alert(url: str) -> None:
     msg = "Zelda Switch 2 may be in stock at Target!"
     print(f"\n*** {msg} ***\n{url}\n")
@@ -58,6 +113,7 @@ def alert(url: str) -> None:
             notification.notify(title="IN STOCK", message=msg, timeout=30)
         except Exception:
             pass
+    push(NTFY_TOPIC, "IN STOCK at Target", msg + " Tap to open.", url, priority="urgent")
     webbrowser.open(url)
 
 
@@ -79,7 +135,17 @@ def looks_in_stock(page) -> bool:
 
 
 def main() -> None:
+    global NTFY_TOPIC
     url = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_URL
+    NTFY_TOPIC = get_ntfy_topic()
+    if NTFY_TOPIC:
+        print("=" * 60)
+        print("PHONE ALERTS: in the ntfy app, subscribe to this topic:")
+        print(f"    {NTFY_TOPIC}")
+        print("=" * 60)
+        if push(NTFY_TOPIC, "Target watcher started",
+                "Test push - you'll get an urgent alert here when it's in stock.", url):
+            print("Test push sent. Check your phone.\n")
     print(f"Watching: {url}\nChecking every {MIN_WAIT}-{MAX_WAIT}s. Ctrl+C to stop.\n")
 
     with sync_playwright() as p:
