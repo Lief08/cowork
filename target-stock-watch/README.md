@@ -32,8 +32,13 @@ To watch a different item, pass its URL:
 
 When stock shows up you get an urgent push that opens the Target page when tapped. Set `NTFY_TOPIC=off` to disable, or `NTFY_TOPIC=your-topic` to pick your own name. Anyone who knows the topic name can see its messages, so keep it random.
 
+## Bot checks
+
+Target sometimes shows a "press & hold" check. When that happens the watcher pushes a "Watcher needs you" alert to your phone and backs off. Solve it yourself in the watcher's Chrome window. The browser profile in `.browser-profile/` keeps cookies between runs, so you usually only need to do this once in a while.
+
 ## Notes
 
+- After an alert it waits 5 minutes, then keeps watching on its own.
 - Checks every 45–90 seconds. Don't shorten this much; Target will rate-limit you.
 - A Chrome window stays open while it runs; leave it alone.
 - Be signed in to Target in your normal browser with payment saved so checkout is fast.

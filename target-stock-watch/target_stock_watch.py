@@ -45,11 +45,15 @@ DEFAULT_URL = (
     "40th-anniversary-edition-console-system/-/A-1013322047"
 )
 
-TOPIC_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".ntfy_topic")
+HERE = os.path.dirname(os.path.abspath(__file__))
+TOPIC_FILE = os.path.join(HERE, ".ntfy_topic")
+PROFILE_DIR = os.path.join(HERE, ".browser-profile")  # keeps cookies between runs
 NTFY_SERVER = "https://ntfy.sh"
 
 MIN_WAIT = 45   # seconds
 MAX_WAIT = 90   # seconds
+ALERT_COOLDOWN = 300      # after an alert, wait 5 min before alerting again
+CHALLENGE_BACKOFF = 240   # after a bot check, wait 4 min before reloading
 
 # Target's buy buttons have used these data-test values; text check is a fallback.
 BUY_SELECTORS = [
@@ -59,6 +63,8 @@ BUY_SELECTORS = [
     'button[data-test="scheduledDeliveryButton"]',
 ]
 BUY_TEXT = ["add to cart", "ship it", "pick it up", "deliver it"]
+CHALLENGE_TEXT = ["press & hold", "press and hold", "confirm you are a human",
+                  "verify you are a human", "access to this page has been denied"]
 OOS_TEXT = ["out of stock", "sold out", "not available", "temporarily out",
             "isn't available", "unavailable", "coming soon"]
 
@@ -129,21 +135,69 @@ def alert(url: str) -> None:
     webbrowser.open(url)
 
 
+# Target often greys out buttons with aria-disabled or a CSS class instead of
+# the real "disabled" attribute, so Playwright's is_enabled() isn't enough.
+_REALLY_CLICKABLE_JS = """
+el => {
+  if (el.disabled) return false;
+  if ((el.getAttribute('aria-disabled') || '').toLowerCase() === 'true') return false;
+  if (/disabled/i.test(el.className || '')) return false;
+  const st = getComputedStyle(el);
+  if (st.pointerEvents === 'none') return false;
+  if (parseFloat(st.opacity || '1') < 0.6) return false;
+  const r = el.getBoundingClientRect();
+  return r.width > 0 && r.height > 0;
+}
+"""
+
+
+def _clickable(btn) -> bool:
+    try:
+        return bool(btn.evaluate(_REALLY_CLICKABLE_JS))
+    except Exception:
+        return False
+
+
 def looks_in_stock(page) -> bool:
     for sel in BUY_SELECTORS:
-        btn = page.query_selector(sel)
-        if btn and btn.is_visible() and btn.is_enabled():
-            return True
+        for btn in page.query_selector_all(sel):
+            if _clickable(btn):
+                return True
 
-    # Fallback: any enabled button whose text says add/ship/pickup
+    # Fallback: any clickable button whose text says add/ship/pickup
     for btn in page.query_selector_all("button"):
         try:
             text = (btn.inner_text() or "").strip().lower()
         except Exception:
             continue
-        if any(t in text for t in BUY_TEXT) and btn.is_enabled() and btn.is_visible():
+        if any(t in text for t in BUY_TEXT) and _clickable(btn):
             return True
     return False
+
+
+def is_bot_challenge(page, body: str) -> bool:
+    if any(t in body for t in CHALLENGE_TEXT):
+        return True
+    try:
+        return page.query_selector("#px-captcha") is not None
+    except Exception:
+        return False
+
+
+def load(page, url: str) -> str:
+    page.goto(url, wait_until="domcontentloaded", timeout=30000)
+    page.wait_for_timeout(5000)  # let the buy box render
+    return page.inner_text("body").lower()
+
+
+def launch(p):
+    """Persistent profile so cookies (and a solved bot check) survive between
+    checks and runs. Prefer the real installed Chrome; fall back to Chromium."""
+    opts = dict(headless=False, viewport={"width": 1280, "height": 900})
+    try:
+        return p.chromium.launch_persistent_context(PROFILE_DIR, channel="chrome", **opts)
+    except Exception:
+        return p.chromium.launch_persistent_context(PROFILE_DIR, **opts)
 
 
 def main() -> None:
@@ -161,29 +215,48 @@ def main() -> None:
     print(f"Watching: {url}\nChecking every {MIN_WAIT}-{MAX_WAIT}s. Ctrl+C to stop.\n")
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
-        page = browser.new_page()
+        ctx = launch(p)
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
         checks = 0
+        challenge_notified = False
         while True:
             checks += 1
             stamp = datetime.now().strftime("%H:%M:%S")
+            wait = random.uniform(MIN_WAIT, MAX_WAIT)
             try:
-                page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                page.wait_for_timeout(4000)  # let the buy box render
-                body = page.inner_text("body").lower()
+                body = load(page, url)
 
-                if looks_in_stock(page):
-                    alert(url)
-                    input("Press Enter to keep watching, or Ctrl+C to quit...")
+                if is_bot_challenge(page, body):
+                    print(f"[{stamp}] check #{checks}: Target is showing a bot check. "
+                          "Press & hold the button in the watcher's Chrome window.")
+                    if not challenge_notified:
+                        push(NTFY_TOPIC, "Watcher needs you",
+                             "Target is showing a 'press & hold' bot check. Solve it in the "
+                             "watcher's Chrome window on your PC so checks can continue.",
+                             priority="high")
+                        challenge_notified = True
+                    wait = CHALLENGE_BACKOFF
+                elif looks_in_stock(page):
+                    # Confirm with a second load so one glitchy render doesn't page you.
+                    page.wait_for_timeout(3000)
+                    body = load(page, url)
+                    if looks_in_stock(page):
+                        challenge_notified = False
+                        alert(url)
+                        print(f"Cooling down {ALERT_COOLDOWN // 60} min before checking again.")
+                        wait = ALERT_COOLDOWN
+                    else:
+                        print(f"[{stamp}] check #{checks}: buy button flickered, not confirmed")
                 else:
-                    status = "out of stock" if any(t in body for t in OOS_TEXT) else "no buy button"
+                    challenge_notified = False
+                    status = "out of stock" if any(t in body for t in OOS_TEXT) else "no clickable buy button"
                     print(f"[{stamp}] check #{checks}: {status}")
             except PWTimeout:
                 print(f"[{stamp}] check #{checks}: page timed out")
             except Exception as e:
                 print(f"[{stamp}] check #{checks}: error {e}")
 
-            time.sleep(random.uniform(MIN_WAIT, MAX_WAIT))
+            time.sleep(wait)
 
 
 if __name__ == "__main__":
